@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""ccm - Claude Code 会话管理控制台
+
+列出 ~/.claude/projects 下所有会话，按工作区分组；选中后在对应工作区目录执行
+`claude --resume <session-id>`。
+
+按键: ↑/↓ 移动  PgUp/PgDn 翻页  输入文字=过滤  Backspace 删除过滤字符
+      Enter 打开  Ctrl-D 删除会话  Ctrl-X 删除整个工作区的会话
+      Ctrl-T 回收站  Esc 清空过滤/退出  Ctrl-C 退出
+删除的会话会移到 ~/.claude/ccm-trash/ 下。
+回收站: Enter 恢复  Ctrl-D 永久删除  Ctrl-E 清空回收站  Esc 返回
+"""
+import curses
+import glob
+import json
+import locale
+import os
+import shutil
+import sys
+import time
+import unicodedata
+
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+TRASH_DIR = os.path.join(CLAUDE_DIR, "ccm-trash")
+
+
+# ---------- 数据读取 ----------
+
+def _user_text(msg):
+    """从 user 记录中取出真正的用户输入文本；命令/系统注入内容返回 None。"""
+    if msg.get("isMeta") or msg.get("isSidechain"):
+        return None
+    content = (msg.get("message") or {}).get("content")
+    if isinstance(content, list):
+        texts = [c.get("text", "") for c in content
+                 if isinstance(c, dict) and c.get("type") == "text"]
+        if not texts:  # 纯 tool_result
+            return None
+        content = " ".join(texts)
+    if not isinstance(content, str):
+        return None
+    content = content.strip()
+    if not content or content.startswith("<"):
+        return None
+    return content
+
+
+def load_session(path):
+    custom_title = ai_title = summary = first_prompt = last_prompt = None
+    cwd = None
+    user_count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 先做廉价的子串判断，避免对每行都 json 解析
+                if '"type":"user"' in line:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "user":
+                        continue
+                    if cwd is None:
+                        cwd = rec.get("cwd")
+                    text = _user_text(rec)
+                    if text:
+                        user_count += 1
+                        if first_prompt is None:
+                            first_prompt = text
+                elif line.startswith('{"type":"custom-title"'):
+                    try:
+                        custom_title = json.loads(line).get("customTitle") or custom_title
+                    except ValueError:
+                        pass
+                elif line.startswith('{"type":"ai-title"'):
+                    try:
+                        ai_title = json.loads(line).get("aiTitle") or ai_title
+                    except ValueError:
+                        pass
+                elif line.startswith('{"type":"summary"'):
+                    try:
+                        summary = json.loads(line).get("summary") or summary
+                    except ValueError:
+                        pass
+                elif line.startswith('{"type":"last-prompt"'):
+                    try:
+                        last_prompt = json.loads(line).get("lastPrompt") or last_prompt
+                    except ValueError:
+                        pass
+                elif cwd is None and '"cwd":"' in line:
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except ValueError:
+                        pass
+    except OSError:
+        return None
+
+    if user_count == 0:  # 空会话（只 /clear 过等），不展示
+        return None
+    title = custom_title or ai_title or summary or first_prompt or "(无标题)"
+    if cwd is None:  # 兜底：从目录名还原（有损，'-' 会被当成 '/'）
+        cwd = os.path.basename(os.path.dirname(path)).replace("-", "/")
+    return {
+        "id": os.path.splitext(os.path.basename(path))[0],
+        "path": path,
+        "cwd": cwd,
+        "title": " ".join(title.split()),
+        "last_prompt": " ".join((last_prompt or "").split()),
+        "mtime": os.path.getmtime(path),
+        "count": user_count,
+    }
+
+
+def load_all():
+    sessions = []
+    for p in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
+        s = load_session(p)
+        if s:
+            sessions.append(s)
+    groups = {}
+    for s in sessions:
+        groups.setdefault(s["cwd"], []).append(s)
+    for lst in groups.values():
+        lst.sort(key=lambda s: s["mtime"], reverse=True)
+    # 工作区按最近活跃时间排序
+    return sorted(groups.items(), key=lambda kv: kv[1][0]["mtime"], reverse=True)
+
+
+def trash_session(s):
+    """把会话相关文件移到回收站，保留相对 ~/.claude 的路径结构。"""
+    sid = s["id"]
+    proj = os.path.dirname(s["path"])
+    candidates = [
+        s["path"],                                   # 会话记录
+        os.path.join(proj, sid),                     # 子代理等附属数据
+        os.path.join(CLAUDE_DIR, "session-env", sid),
+        os.path.join(CLAUDE_DIR, "file-history", sid),
+    ]
+    dest_root = os.path.join(TRASH_DIR, time.strftime("%Y%m%d-%H%M%S") + "_" + sid)
+    for src in candidates:
+        if os.path.lexists(src):
+            dest = os.path.join(dest_root, os.path.relpath(src, CLAUDE_DIR))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(src, dest)
+
+
+def remove_from_groups(groups, targets):
+    ids = {t["id"] for t in targets}
+    for cwd, lst in groups:
+        lst[:] = [x for x in lst if x["id"] not in ids]
+    groups[:] = [(c, l) for c, l in groups if l]
+
+
+# ---------- 显示工具 ----------
+
+def dwidth(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def clip(s, width):
+    """按终端显示宽度截断（中文占 2 列）。"""
+    if width <= 0:
+        return ""
+    if dwidth(s) <= width:
+        return s
+    out, w = [], 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if w + cw > width - 1:
+            break
+        out.append(c)
+        w += cw
+    return "".join(out) + "…"
+
+
+def fmt_time(ts):
+    t = time.localtime(ts)
+    if t.tm_year == time.localtime().tm_year:
+        return time.strftime("%m-%d %H:%M", t)
+    return time.strftime("%Y-%m-%d", t)
+
+
+def short_path(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
+# ---------- TUI ----------
+
+def build_rows(groups, query):
+    """rows: ('ws', cwd, n) 或 ('s', session)；返回 rows 和可选中行的下标。"""
+    q = query.lower()
+    rows, selectable = [], []
+    for cwd, lst in groups:
+        if q:
+            if q in cwd.lower():
+                hits = lst
+            else:
+                hits = [s for s in lst if q in s["title"].lower()
+                        or q in s["last_prompt"].lower() or s["id"].startswith(q)]
+        else:
+            hits = lst
+        if not hits:
+            continue
+        rows.append(("ws", cwd, len(hits)))
+        for s in hits:
+            selectable.append(len(rows))
+            rows.append(("s", s))
+    return rows, selectable
+
+
+ESC_SEQS = {"A": curses.KEY_UP, "B": curses.KEY_DOWN, "H": curses.KEY_HOME,
+            "F": curses.KEY_END, "5~": curses.KEY_PPAGE, "6~": curses.KEY_NPAGE,
+            "1~": curses.KEY_HOME, "4~": curses.KEY_END}
+
+
+def read_escape(stdscr):
+    """curses 没识别的方向键序列（如 ESC [ B）手动解析；单独的 Esc 原样返回。"""
+    stdscr.nodelay(True)
+    try:
+        seq = ""
+        while True:
+            try:
+                c = stdscr.get_wch()
+            except curses.error:
+                break
+            if not isinstance(c, str):
+                break
+            seq += c
+            if len(seq) > 1 and (c.isalpha() or c == "~"):
+                break
+    finally:
+        stdscr.nodelay(False)
+    if seq[:1] in ("[", "O"):
+        return ESC_SEQS.get(seq[1:], None)
+    return "\x1b" if not seq else None
+
+
+# ---------- 回收站 ----------
+
+def _trash_units(entry):
+    """回收站条目里可移回的单元（与 trash_session 移入的路径一一对应）。"""
+    units = glob.glob(os.path.join(entry, "projects", "*", "*"))
+    for sub in ("session-env", "file-history"):
+        units += glob.glob(os.path.join(entry, sub, "*"))
+    return units
+
+
+def load_trash():
+    items = []
+    for entry in glob.glob(os.path.join(TRASH_DIR, "*_*")):
+        name = os.path.basename(entry)
+        stamp, _, sid = name.partition("_")
+        try:
+            deleted = time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S"))
+        except ValueError:
+            deleted = os.path.getmtime(entry)
+        files = glob.glob(os.path.join(entry, "projects", "*", sid + ".jsonl"))
+        s = load_session(files[0]) if files else None
+        items.append({
+            "entry": entry,
+            "id": sid,
+            "deleted": deleted,
+            "title": s["title"] if s else "(无会话记录)",
+            "cwd": s["cwd"] if s else "?",
+        })
+    items.sort(key=lambda x: x["deleted"], reverse=True)
+    return items
+
+
+def _remove_empty_dirs(root):
+    for d, _, _ in sorted(os.walk(root), key=lambda t: len(t[0]), reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
+def restore_item(item):
+    """恢复到原位置；若原位置已有同名文件则整条放弃，返回错误信息。"""
+    entry = item["entry"]
+    pairs = [(u, os.path.join(CLAUDE_DIR, os.path.relpath(u, entry)))
+             for u in _trash_units(entry)]
+    clash = [d for _, d in pairs if os.path.lexists(d)]
+    if clash:
+        return f"原位置已存在 {short_path(clash[0])}，未恢复"
+    for src, dest in pairs:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(src, dest)
+    _remove_empty_dirs(entry)
+    return None
+
+
+def purge_item(item):
+    entry = os.path.realpath(item["entry"])
+    # 只允许删除回收站目录下的条目
+    if os.path.dirname(entry) != os.path.realpath(TRASH_DIR):
+        raise OSError(f"拒绝删除回收站外的路径: {entry}")
+    shutil.rmtree(entry)
+
+
+def confirm(stdscr, text):
+    h, w = stdscr.getmaxyx()
+    stdscr.move(h - 2, 0)
+    stdscr.clrtoeol()
+    stdscr.addstr(h - 2, 0, clip(" " + text + " (y/N)", w - 1),
+                  curses.color_pair(3) | curses.A_BOLD)
+    stdscr.refresh()
+    try:
+        return stdscr.get_wch() in ("y", "Y")
+    except KeyboardInterrupt:
+        return False
+
+
+def trash_ui(stdscr):
+    """回收站界面；返回是否恢复过会话（需要刷新主列表）。"""
+    restored = False
+    sel = top = 0
+    msg = ""
+    while True:
+        items = load_trash()
+        sel = max(0, min(sel, len(items) - 1))
+        h, w = stdscr.getmaxyx()
+        list_h = max(1, h - 3)
+        if sel < top:
+            top = sel
+        if sel >= top + list_h:
+            top = sel - list_h + 1
+
+        stdscr.erase()
+        stdscr.addstr(0, 0, clip(f" 回收站  共 {len(items)} 个会话", w - 1),
+                      curses.A_BOLD | curses.color_pair(3))
+        for i in range(list_h):
+            ri = top + i
+            if ri >= len(items):
+                break
+            it = items[ri]
+            is_sel = ri == sel
+            line = (f"  {'❯ ' if is_sel else '  '}删于 {fmt_time(it['deleted'])}  "
+                    f"{short_path(it['cwd'])}  {it['title']}")
+            stdscr.addstr(i + 1, 0, clip(line, w - 1),
+                          curses.A_REVERSE if is_sel else curses.A_NORMAL)
+        if not items:
+            stdscr.addstr(1, 0, "  回收站是空的")
+        info = msg or (f" {items[sel]['id']}" if items else "")
+        stdscr.addstr(h - 2, 0, clip(info, w - 1), curses.A_DIM)
+        stdscr.addstr(h - 1, 0, clip(
+            " Enter恢复  ^D永久删除  ^E清空回收站  Esc返回", w - 1))
+        stdscr.refresh()
+
+        try:
+            ch = stdscr.get_wch()
+        except KeyboardInterrupt:
+            return restored
+        msg = ""
+        if ch == "\x1b":
+            ch = read_escape(stdscr)
+            if ch == "\x1b":
+                return restored
+        if ch == curses.KEY_UP:
+            sel -= 1
+        elif ch == curses.KEY_DOWN:
+            sel += 1
+        elif ch == curses.KEY_PPAGE:
+            sel -= list_h // 2
+        elif ch == curses.KEY_NPAGE:
+            sel += list_h // 2
+        elif ch in ("\n", "\r", curses.KEY_ENTER) and items:
+            it = items[sel]
+            try:
+                err = restore_item(it)
+            except OSError as e:
+                err = f"恢复失败: {e}"
+            if err:
+                msg = err
+            else:
+                restored = True
+                msg = f"已恢复: {clip(it['title'], 40)}"
+        elif ch == "\x04" and items:
+            it = items[sel]
+            if confirm(stdscr, f"永久删除「{clip(it['title'], 40)}」？无法撤销"):
+                try:
+                    purge_item(it)
+                    msg = "已永久删除"
+                except OSError as e:
+                    msg = f"删除失败: {e}"
+            else:
+                msg = "已取消"
+        elif ch == "\x05" and items:
+            if confirm(stdscr, f"清空回收站，永久删除全部 {len(items)} 个会话？无法撤销"):
+                try:
+                    for it in items:
+                        purge_item(it)
+                    msg = "回收站已清空"
+                except OSError as e:
+                    msg = f"清空失败: {e}"
+            else:
+                msg = "已取消"
+
+
+def ui(stdscr, groups):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)    # 工作区
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # 时间
+    curses.init_pair(3, curses.COLOR_RED, -1)     # 目录不存在
+    stdscr.keypad(True)
+
+    query = ""
+    msg = ""  # 底部提示（删除结果等）
+    sel = 0   # 在 selectable 中的位置
+    top = 0   # 列表首行
+    while True:
+        rows, selectable = build_rows(groups, query)
+        sel = max(0, min(sel, len(selectable) - 1))
+        h, w = stdscr.getmaxyx()
+        list_h = max(1, h - 3)
+
+        cur_row = selectable[sel] if selectable else 0
+        # 让选中行可见；若选中的是工作区第一项，把工作区标题也带上
+        if cur_row - 1 < top:
+            top = max(0, cur_row - 1)
+        if cur_row >= top + list_h:
+            top = cur_row - list_h + 1
+
+        stdscr.erase()
+        total = sum(len(l) for _, l in groups)
+        header = f" Claude Code 会话  共 {len(groups)} 个工作区 / {total} 个会话"
+        stdscr.addstr(0, 0, clip(header, w - 1), curses.A_BOLD)
+
+        for i in range(list_h):
+            ri = top + i
+            if ri >= len(rows):
+                break
+            y = i + 1
+            row = rows[ri]
+            if row[0] == "ws":
+                cwd, n = row[1], row[2]
+                missing = "" if os.path.isdir(cwd) else "  [目录不存在]"
+                text = f"▸ {short_path(cwd)}  ({n}){missing}"
+                attr = curses.color_pair(3 if missing else 1) | curses.A_BOLD
+                stdscr.addstr(y, 0, clip(text, w - 1), attr)
+            else:
+                s = row[1]
+                is_sel = selectable and ri == cur_row
+                mark = "❯ " if is_sel else "  "
+                t = fmt_time(s["mtime"])
+                prefix = f"  {mark}{t}  "
+                rest = f"{s['title']}  [{s['count']}条]"
+                attr = curses.A_REVERSE if is_sel else curses.A_NORMAL
+                stdscr.addstr(y, 0, clip(prefix, w - 1), attr)
+                pw = dwidth(prefix)
+                if pw < w - 1:
+                    stdscr.addstr(y, pw, clip(rest, w - 1 - pw), attr)
+                if not is_sel:
+                    stdscr.addstr(y, 4, t, curses.color_pair(2))
+
+        # 底部：选中会话的详情 + 过滤框
+        if msg:
+            info = " " + msg
+        elif selectable:
+            s = rows[cur_row][1]
+            info = f" {s['id']}  最近输入: {s['last_prompt'] or '-'}"
+        else:
+            info = " 没有匹配的会话"
+        stdscr.addstr(h - 2, 0, clip(info, w - 1), curses.A_DIM)
+        prompt = f" 过滤> {query}"
+        hint = "  ↑↓选择 Enter打开 ^D删会话 ^X删工作区 ^T回收站 Esc清空/退出"
+        stdscr.addstr(h - 1, 0, clip(prompt + hint, w - 1))
+        stdscr.refresh()
+
+        try:
+            ch = stdscr.get_wch()
+        except KeyboardInterrupt:
+            return None
+        msg = ""
+        if ch == "\x1b":
+            ch = read_escape(stdscr)
+        if ch == curses.KEY_RESIZE:
+            continue
+        if ch == "\x14":  # Ctrl-T 回收站
+            if trash_ui(stdscr):
+                groups[:] = load_all()
+            sel, top = 0, 0
+            continue
+        if ch in ("\x04", "\x18") and selectable:  # Ctrl-D / Ctrl-X
+            cur = rows[cur_row][1]
+            if ch == "\x04":
+                targets = [cur]
+                q = f"删除会话「{clip(cur['title'], 40)}」? (y/N)"
+            else:
+                targets = next(l for c, l in groups if c == cur["cwd"])[:]
+                q = f"删除工作区 {short_path(cur['cwd'])} 下全部 {len(targets)} 个会话? (y/N)"
+            stdscr.move(h - 2, 0)
+            stdscr.clrtoeol()
+            stdscr.addstr(h - 2, 0, clip(" " + q, w - 1),
+                          curses.color_pair(3) | curses.A_BOLD)
+            stdscr.refresh()
+            try:
+                ans = stdscr.get_wch()
+            except KeyboardInterrupt:
+                return None
+            if ans in ("y", "Y"):
+                done = []
+                try:
+                    for t in targets:
+                        trash_session(t)
+                        done.append(t)
+                    msg = f"已删除 {len(done)} 个会话（已移到 ~/.claude/ccm-trash）"
+                except OSError as e:
+                    msg = f"删除失败（已删 {len(done)} 个）: {e}"
+                remove_from_groups(groups, done)
+            else:
+                msg = "已取消"
+            continue
+        if ch in (curses.KEY_UP,):
+            sel -= 1
+        elif ch in (curses.KEY_DOWN,):
+            sel += 1
+        elif ch == curses.KEY_PPAGE:
+            sel -= list_h // 2
+        elif ch == curses.KEY_NPAGE:
+            sel += list_h // 2
+        elif ch == curses.KEY_HOME:
+            sel = 0
+        elif ch == curses.KEY_END:
+            sel = len(selectable) - 1
+        elif ch in ("\n", "\r", curses.KEY_ENTER):
+            if selectable:
+                return rows[selectable[sel]][1]
+        elif ch == "\x1b":  # Esc
+            if query:
+                query, sel, top = "", 0, 0
+            else:
+                return None
+        elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            query = query[:-1]
+            sel, top = 0, 0
+        elif ch == "\x03":
+            return None
+        elif isinstance(ch, str) and ch.isprintable():
+            query += ch
+            sel, top = 0, 0
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")  # Esc 键无延迟
+    groups = load_all()
+    if not groups and not load_trash():
+        print("没有找到任何 Claude Code 会话。")
+        return 1
+    try:
+        s = curses.wrapper(ui, groups)
+    except KeyboardInterrupt:
+        s = None
+    if not s:
+        return 0
+    cwd = s["cwd"]
+    if not os.path.isdir(cwd):
+        print(f"工作区目录不存在: {cwd}")
+        return 1
+    print(f"→ {short_path(cwd)}  恢复会话: {s['title']}")
+    os.chdir(cwd)
+    extra = sys.argv[1:]  # 额外参数透传给 claude
+    if "--dangerously-skip-permissions" not in extra:
+        extra.insert(0, "--dangerously-skip-permissions")  # 默认跳过所有权限确认
+    os.execvp("claude", ["claude", "--resume", s["id"], *extra])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
