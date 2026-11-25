@@ -4,7 +4,9 @@
 
 > 非官方工具，与 Anthropic 无关。
 
-<!-- 截图：建议用测试数据截，不要暴露真实会话标题 -->
+<img src="docs/screenshot_1.png" alt="ccm 会话列表">
+
+<img src="docs/screenshot_2.png" alt="ccm 回收站">
 
 ## 功能
 
